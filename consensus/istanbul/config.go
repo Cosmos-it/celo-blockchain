@@ -23,11 +23,60 @@ const (
 	Sticky
 )
 
+type FaultyMode uint64
+
+const (
+	// Disabled disables the faulty mode
+	Disabled FaultyMode = iota
+	// Random will, at the time of any of the following actions, engage in faulty behavior with 50% probability
+	Random
+	// NotBroadcast doesn't broadcast any messages to other validators
+	NotBroadcast
+	// SendWrongMsg sends the message with the wrong message code
+	SendWrongMsg
+	// ModifySig modifies the message signature
+	ModifySig
+	// AlwaysPropose always proposes a proposal to validators
+	AlwaysPropose
+	// AlwaysRoundChange always sends round change while receiving messages
+	AlwaysRoundChange
+	// BadBlock always proposes a block with bad body
+	BadBlock
+)
+
+func (f FaultyMode) Uint64() uint64 {
+	return uint64(f)
+}
+
+func (f FaultyMode) String() string {
+	switch f {
+	case Disabled:
+		return "Disabled"
+	case Random:
+		return "Random"
+	case NotBroadcast:
+		return "NotBroadcast"
+	case SendWrongMsg:
+		return "SendWrongMsg"
+	case ModifySig:
+		return "ModifySig"
+	case AlwaysPropose:
+		return "AlwaysPropose"
+	case AlwaysRoundChange:
+		return "AlwaysRoundChange"
+	case BadBlock:
+		return "BadBlock"
+	default:
+		return "Undefined"
+	}
+}
+
 type Config struct {
 	RequestTimeout uint64         `toml:",omitempty"` // The timeout for each Istanbul round in milliseconds.
 	BlockPeriod    uint64         `toml:",omitempty"` // Default minimum difference between two consecutive block's timestamps in second
 	ProposerPolicy ProposerPolicy `toml:",omitempty"` // The policy for proposer selection
 	Epoch          uint64         `toml:",omitempty"` // The number of blocks after which to checkpoint and reset the pending votes
+	FaultyMode     uint64         `toml:",omitempty"` // The faulty node indicates the faulty node's behavior
 }
 
 var DefaultConfig = &Config{
@@ -35,4 +84,5 @@ var DefaultConfig = &Config{
 	BlockPeriod:    1,
 	ProposerPolicy: RoundRobin,
 	Epoch:          30000,
+	FaultyMode:     Disabled.Uint64(),
 }

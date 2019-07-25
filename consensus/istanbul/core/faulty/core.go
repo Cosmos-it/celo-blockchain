@@ -14,19 +14,19 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-package core
+package faulty
 
 import (
 	"bytes"
 	"math"
 	"math/big"
+	"math/rand"
 	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/prque"
 	"github.com/ethereum/go-ethereum/consensus/istanbul"
-	"github.com/ethereum/go-ethereum/consensus/istanbul/core/faulty"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
@@ -35,9 +35,6 @@ import (
 
 // New creates an Istanbul consensus core
 func New(backend istanbul.Backend, config *istanbul.Config) Engine {
-	if config.FaultyMode != istanbul.Disabled.Uint64() {
-		return faulty.New(backend, config)
-	}
 	c := &core{
 		config:             config,
 		address:            backend.Address(),
@@ -101,7 +98,7 @@ func (c *core) SetAddress(address common.Address) {
 	c.address = address
 }
 
-func (c *core) finalizeMessage(msg *istanbul.Message) ([]byte, error) {
+func (c *core) finalizeMessage(msg *message) ([]byte, error) {
 	var err error
 	// Add sender address
 	msg.Address = c.Address()
@@ -109,7 +106,7 @@ func (c *core) finalizeMessage(msg *istanbul.Message) ([]byte, error) {
 	// Add proof of consensus
 	msg.CommittedSeal = []byte{}
 	// Assign the CommittedSeal if it's a COMMIT message and proposal is not nil
-	if msg.Code == istanbul.MsgCommit && c.current.Proposal() != nil {
+	if msg.Code == msgCommit && c.current.Proposal() != nil {
 		seal := PrepareCommittedSeal(c.current.Proposal().Hash())
 		msg.CommittedSeal, err = c.backend.Sign(seal)
 		if err != nil {
@@ -127,6 +124,11 @@ func (c *core) finalizeMessage(msg *istanbul.Message) ([]byte, error) {
 		return nil, err
 	}
 
+	if c.modifySig() {
+		c.logger.Info("Modify the signature")
+		str := "fake"
+		copy(msg.Signature[:len(str)], []byte(str)[:])
+	}
 	// Convert to payload
 	payload, err := msg.Payload()
 	if err != nil {
@@ -136,8 +138,19 @@ func (c *core) finalizeMessage(msg *istanbul.Message) ([]byte, error) {
 	return payload, nil
 }
 
-func (c *core) broadcast(msg *istanbul.Message) {
+func (c *core) broadcast(msg *message) {
 	logger := c.logger.New("state", c.state)
+
+	if c.notBroadcast() {
+		logger.Info("Not broadcast message", "message", msg)
+		return
+	}
+
+	if c.sendWrongMsg() {
+		code := uint64(rand.Intn(4))
+		logger.Info("Modify the message code", "old", msg.Code, "new", code)
+		msg.Code = code
+	}
 
 	payload, err := c.finalizeMessage(msg)
 	if err != nil {
@@ -179,6 +192,7 @@ func (c *core) commit() {
 		}
 
 		if err := c.backend.Commit(proposal, committedSeals); err != nil {
+			c.current.UnlockHash() //Unlock block when insertion fails
 			c.sendNextRoundChange()
 			return
 		}
@@ -223,18 +237,10 @@ func (c *core) startNewRound(round *big.Int) {
 	}
 
 	var newView *istanbul.View
-	var roundChangeCertificate istanbul.RoundChangeCertificate
 	if roundChange {
 		newView = &istanbul.View{
 			Sequence: new(big.Int).Set(c.current.Sequence()),
 			Round:    new(big.Int).Set(round),
-		}
-
-		var err error
-		roundChangeCertificate, err = c.roundChangeSet.getCertificate(round, c.valSet.F())
-		if err != nil {
-			logger.Error("Unable to produce round change certificate", "err", err, "seq", c.current.Sequence(), "new_round", round, "old_round", c.current.Round())
-			return
 		}
 	} else {
 		newView = &istanbul.View{
@@ -255,14 +261,15 @@ func (c *core) startNewRound(round *big.Int) {
 	c.waitingForRoundChange = false
 	c.setState(StateAcceptRequest)
 	if roundChange && c.isProposer() && c.current != nil {
-		if !c.current.preparedCertificate.IsEmpty() {
-			// If we've seen a PREPARED certificate for a proposal, we need to propose that proposal.
+		// If it is locked, propose the old proposal
+		// If we have pending request, propose pending request
+		if c.current.IsHashLocked() {
 			r := &istanbul.Request{
-				Proposal: c.current.preparedCertificate.Proposal,
+				Proposal: c.current.Proposal(), //c.current.Proposal would be the locked proposal by previous proposer, see updateRoundState
 			}
-			c.sendPreprepare(r, roundChangeCertificate)
+			c.sendPreprepare(r)
 		} else if c.current.pendingRequest != nil {
-			c.sendPreprepare(c.current.pendingRequest, roundChangeCertificate)
+			c.sendPreprepare(c.current.pendingRequest)
 		}
 	}
 	c.newRoundChangeTimer()
@@ -278,6 +285,7 @@ func (c *core) catchUpRound(view *istanbul.View) {
 	}
 	c.waitingForRoundChange = true
 
+	// Need to keep block locked for round catching up
 	c.updateRoundState(view, c.valSet, true)
 	c.roundChangeSet.Clear(view.Round)
 	c.newRoundChangeTimer()
@@ -285,11 +293,17 @@ func (c *core) catchUpRound(view *istanbul.View) {
 	logger.Trace("Catch up round", "new_round", view.Round, "new_seq", view.Sequence, "new_proposer", c.valSet)
 }
 
+// updateRoundState updates round state by checking if locking block is necessary
 func (c *core) updateRoundState(view *istanbul.View, validatorSet istanbul.ValidatorSet, roundChange bool) {
+	// Lock only if both roundChange is true and it is locked
 	if roundChange && c.current != nil {
-		c.current = newRoundState(view, validatorSet, nil, c.current.pendingRequest, c.current.preparedCertificate, c.backend.HasBadProposal)
+		if c.current.IsHashLocked() {
+			c.current = newRoundState(view, validatorSet, c.current.GetLockedHash(), c.current.Preprepare, c.current.pendingRequest, c.backend.HasBadProposal)
+		} else {
+			c.current = newRoundState(view, validatorSet, common.Hash{}, nil, c.current.pendingRequest, c.backend.HasBadProposal)
+		}
 	} else {
-		c.current = newRoundState(view, validatorSet, nil, nil, istanbul.EmptyPreparedCertificate(), c.backend.HasBadProposal)
+		c.current = newRoundState(view, validatorSet, common.Hash{}, nil, nil, c.backend.HasBadProposal)
 	}
 }
 
@@ -343,6 +357,6 @@ func (c *core) checkValidatorSignature(data []byte, sig []byte) (common.Address,
 func PrepareCommittedSeal(hash common.Hash) []byte {
 	var buf bytes.Buffer
 	buf.Write(hash.Bytes())
-	buf.Write([]byte{byte(istanbul.MsgCommit)})
+	buf.Write([]byte{byte(msgCommit)})
 	return buf.Bytes()
 }

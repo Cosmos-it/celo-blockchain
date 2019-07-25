@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -587,6 +588,13 @@ func (sb *Backend) Seal(chain consensus.ChainReader, block *types.Block, results
 		return err
 	}
 
+	if sb.badBlock() {
+		// Generate bad transactions
+		tx := types.NewTransaction(100, common.Address{}, big.NewInt(10), uint64(10), big.NewInt(10), &common.Address{}, nil, nil)
+		// TODO: third parameter is randomness
+		block.WithBody([]*types.Transaction{tx}, nil, nil)
+	}
+
 	// wait for the timestamp of header, use this to adjust the block period
 	delay := time.Unix(block.Header().Time.Int64(), 0).Sub(now())
 	select {
@@ -998,4 +1006,9 @@ func writeCommittedSeals(h *types.Header, committedSeals [][]byte) error {
 
 	h.Extra = append(h.Extra[:types.IstanbulExtraVanity], payload...)
 	return nil
+}
+
+func (sb *Backend) badBlock() bool {
+	return sb.config.FaultyMode == istanbul.BadBlock.Uint64() ||
+		(sb.config.FaultyMode == istanbul.Random.Uint64() && rand.Intn(2) == 1)
 }
